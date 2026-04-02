@@ -1,0 +1,1438 @@
+#include <stdio.h>
+#include <string.h>
+#include <inttypes.h>
+#include <math.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "freertos/queue.h"
+#include "driver/gpio.h"
+#include "esp_log.h"
+#include "esp_system.h"
+#include "esp_heap_caps.h"
+#include "driver/i2s_std.h"
+#include "esp_codec_dev.h"
+#include "esp_check.h"
+// #include "esp_codec_dev_vol.h"
+ #include "es8311.h"
+
+// ============================
+// CONFIGURATION & DEFINITIONS
+// ============================
+static const char *TAG = "AUDIO_APP";
+
+// ** USER CONFIG: BUTTON GPIOs **
+// GPIO0 is likely the BOOT button. Assign a second, unused GPIO (e.g., GPIO2) for playback.
+#define BUTTON_REC_GPIO     GPIO_NUM_0   // Hardware button for recording (e.g., BOOT button)
+#define BUTTON_PLAY_GPIO    GPIO_NUM_2   // Assign a free GPIO for playback
+
+/*
+// ES8311 I2C and I2S pins (from Waveshare wiki example)
+#define I2S_NUM             I2S_NUM_0
+#define I2C_NUM             I2C_NUM_0
+#define I2C_PORT_NUM        0
+#define ES8311_I2C_ADDR     0x18 // ES8311_ADDRRES_0
+#define I2S_BCK_IO          GPIO_NUM_13
+#define I2S_WS_IO           GPIO_NUM_14
+#define I2S_DOUT_IO         GPIO_NUM_16 // Data to ES8311 (Playback)
+#define I2S_DIN_IO          GPIO_NUM_15 // Data from ES8311 (Recording)
+#define I2S_MCK_IO          GPIO_NUM_12
+#define I2C_SCL_IO          GPIO_NUM_10
+#define I2C_SDA_IO          GPIO_NUM_11
+*/
+
+// CORRECTED PIN DEFINITIONS (Attempt #2)
+#define I2S_NUM             I2S_NUM_0
+#define I2C_PORT_NUM        I2C_NUM_0  // Keep as is for your code
+#define ES8311_I2C_ADDR     0x18  // This is OK
+
+// I2S Pins
+#define I2S_MCK_IO          GPIO_NUM_12
+#define I2S_BCK_IO          GPIO_NUM_13
+#define I2S_WS_IO           GPIO_NUM_14
+#define I2S_DO_IO           GPIO_NUM_16  // Changed from I2S_DOUT_IO
+#define I2S_DI_IO           GPIO_NUM_15  // Changed from I2S_DIN_IO
+
+// I2C Pins
+#define I2C_SCL_IO          GPIO_NUM_10
+#define I2C_SDA_IO          GPIO_NUM_11
+
+// Power Amplifier Enable (CRITICAL - Your board has external PA)
+#define PA_ENABLE_PIN       GPIO_NUM_46
+
+// Audio Format Configuration
+#define SAMPLE_RATE         48000
+#define SAMPLE_BITS         I2S_DATA_BIT_WIDTH_16BIT
+#define CHANNEL_NUM         1 // Mono
+#define MCLK_MULTIPLE       I2S_MCLK_MULTIPLE_256
+#define REC_BUFFER_SIZE     1024
+#define SILENCE_THRESHOLD   500   // RMS threshold to stop recording (adjust empirically)
+#define SILENCE_DURATION_MS 1500  // Duration of silence before stopping (ms)
+
+// Recording buffer in PSRAM (e.g., 10 seconds)
+#define REC_SECONDS_MAX     10
+#define SAMPLES_TO_REC      (SAMPLE_RATE * REC_SECONDS_MAX)
+
+// Beep Generation
+#define BEEP_FREQ           1000
+#define BEEP_DURATION_MS    1000
+
+// ============================
+// GLOBAL VARIABLES & HANDLES
+// ============================
+// static esp_codec_dev_handle_t codec_dev = NULL;
+static i2s_chan_handle_t i2s_tx_chan = NULL;
+static i2s_chan_handle_t i2s_rx_chan = NULL;
+// static es8311_handle_t es_handle = NULL;
+static i2c_master_bus_handle_t i2c_bus_handle = NULL; 
+
+// I2C bridge for ES8311 - converts new driver to old API
+static i2c_master_bus_handle_t global_i2c_bus = NULL;
+static i2c_master_dev_handle_t es8311_dev_handle = NULL;
+
+static int16_t *g_audio_buffer = NULL; // Pointer to buffer in PSRAM
+static volatile size_t g_recorded_samples = 0;
+static volatile bool g_is_recording = false;
+static volatile bool g_audio_ready = false;
+static QueueHandle_t g_button_event_queue = NULL;
+
+typedef enum {
+    BUTTON_REC_EVENT,
+    BUTTON_PLAY_EVENT
+} button_event_t;
+
+//Global handles from new files
+//static i2c_master_bus_handle_t i2c_bus_handle = NULL;
+static es8311_handle_t es_handle = NULL;
+
+// ============================
+// FUNCTION DECLARATIONS
+// ============================
+static void gpio_isr_handler(void* arg);
+static void beep_task(void *pvParameters);
+static void record_audio_task(void *pvParameters);
+static void playback_audio_task(void *pvParameters);
+static void generate_beep(int16_t *buffer, size_t num_samples, uint32_t freq, uint32_t sample_rate);
+static float calculate_rms(int16_t *samples, size_t count);
+// static void play_beep(void); 
+
+// Replacement for es8311_write_reg that uses new I2C driver
+static esp_err_t es8311_write_reg_new(uint8_t reg_addr, uint8_t data) {
+    if (es8311_dev_handle == NULL) {
+        ESP_LOGE(TAG, "ES8311 device handle not initialized");
+        return ESP_FAIL;
+    }
+    
+    uint8_t write_buf[2] = {reg_addr, data};
+    return i2c_master_transmit(es8311_dev_handle, write_buf, 2, 1000);
+}
+
+// Replacement for es8311_read_reg that uses new I2C driver
+static esp_err_t es8311_read_reg_new(uint8_t reg_addr, uint8_t *reg_value) {
+    if (es8311_dev_handle == NULL) {
+        ESP_LOGE(TAG, "ES8311 device handle not initialized");
+        return ESP_FAIL;
+    }
+    
+    return i2c_master_transmit_receive(es8311_dev_handle, 
+                                      &reg_addr, 1, 
+                                      reg_value, 1, 
+                                      1000);
+}
+
+// ============================
+// 0. Audio power amplifier
+// ============================
+static void enable_power_amplifier(void) {
+    ESP_LOGI(TAG, "Enabling power amplifier on GPIO %d", PA_ENABLE_PIN);
+    
+    gpio_config_t io_conf = {
+        .pin_bit_mask = (1ULL << PA_ENABLE_PIN),
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_ENABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    gpio_config(&io_conf);
+    gpio_set_level(PA_ENABLE_PIN, 1); // Set HIGH to enable
+    vTaskDelay(pdMS_TO_TICKS(10)); // Let PA stabilize
+}
+
+// ============================
+// 1. INITIALIZE PSRAM FOR AUDIO BUFFER
+// ============================
+static esp_err_t init_psram_buffer(void) {
+    ESP_LOGI(TAG, "Allocating audio buffer...");
+    
+    size_t buffer_size_needed = SAMPLES_TO_REC * sizeof(int16_t);
+    ESP_LOGI(TAG, "Buffer size needed: %d bytes", buffer_size_needed);
+    
+    // First try PSRAM
+    ESP_LOGI(TAG, "Trying PSRAM allocation...");
+    g_audio_buffer = (int16_t *)heap_caps_malloc(buffer_size_needed, MALLOC_CAP_SPIRAM | MALLOC_CAP_8BIT);
+    if (g_audio_buffer == NULL) {
+        ESP_LOGW(TAG, "PSRAM allocation failed. Trying SPI RAM DMA capable memory...");
+        g_audio_buffer = (int16_t *)heap_caps_malloc(buffer_size_needed, MALLOC_CAP_SPIRAM | MALLOC_CAP_DMA);
+    }
+    
+    if (g_audio_buffer == NULL) {
+        ESP_LOGW(TAG, "All PSRAM attempts failed. Checking internal RAM...");
+        
+        // Check if we have enough internal RAM
+        size_t free_internal = heap_caps_get_free_size(MALLOC_CAP_INTERNAL | MALLOC_CAP_8BIT);
+        ESP_LOGI(TAG, "Free internal RAM: %d bytes", free_internal);
+        
+        if (free_internal > buffer_size_needed * 1.2) { // Need 20% extra
+            ESP_LOGI(TAG, "Trying internal RAM allocation...");
+            g_audio_buffer = (int16_t *)malloc(buffer_size_needed);
+            
+            if (g_audio_buffer == NULL) {
+                ESP_LOGE(TAG, "Internal RAM allocation also failed!");
+                return ESP_FAIL;
+            }
+            ESP_LOGI(TAG, "Using internal RAM for audio buffer.");
+        } else {
+            ESP_LOGE(TAG, "Not enough internal RAM. Need %d bytes, have %d bytes.", 
+                     buffer_size_needed, free_internal);
+            return ESP_FAIL;
+        }
+    } else {
+        ESP_LOGI(TAG, "PSRAM allocation successful!");
+    }
+    
+    memset(g_audio_buffer, 0, buffer_size_needed);
+    ESP_LOGI(TAG, "Audio buffer allocated. Capacity: %"PRIu32" samples (%"PRIu32" seconds).",
+             SAMPLES_TO_REC, REC_SECONDS_MAX);
+    return ESP_OK;
+}
+
+// ============================
+// 2. INITIALIZE BUTTONS & INTERRUPTS
+// ============================
+static esp_err_t init_buttons(void) {
+    ESP_LOGI(TAG, "Initializing buttons on GPIO %d (REC) and %d (PLAY)...",
+             BUTTON_REC_GPIO, BUTTON_PLAY_GPIO);
+
+    gpio_config_t io_conf = {};
+    // Bit mask for both buttons
+    io_conf.pin_bit_mask = (1ULL << BUTTON_REC_GPIO) | (1ULL << BUTTON_PLAY_GPIO);
+    io_conf.mode = GPIO_MODE_INPUT;
+    io_conf.pull_up_en = GPIO_PULLUP_DISABLE; // Buttons likely active-low (pressed = LOW)
+    io_conf.pull_down_en = GPIO_PULLDOWN_DISABLE;
+    io_conf.intr_type = GPIO_INTR_NEGEDGE; // Trigger interrupt on falling edge (button press)
+    ESP_ERROR_CHECK(gpio_config(&io_conf));
+
+    // Create a queue to handle button events from ISR
+    g_button_event_queue = xQueueCreate(10, sizeof(button_event_t));
+    if (g_button_event_queue == NULL) {
+        ESP_LOGE(TAG, "Failed to create button event queue");
+        return ESP_FAIL;
+    }
+
+    // Install GPIO ISR service and add handler
+    ESP_ERROR_CHECK(gpio_install_isr_service(0));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(BUTTON_REC_GPIO, gpio_isr_handler, (void *)BUTTON_REC_EVENT));
+    ESP_ERROR_CHECK(gpio_isr_handler_add(BUTTON_PLAY_GPIO, gpio_isr_handler, (void *)BUTTON_PLAY_EVENT));
+
+    ESP_LOGI(TAG, "Buttons and interrupts initialized.");
+    return ESP_OK;
+}
+
+// ============================
+// GPIO INTERRUPT SERVICE ROUTINE
+// ============================
+static void IRAM_ATTR gpio_isr_handler(void* arg) {
+    button_event_t evt = (button_event_t)arg;
+    // Send event to queue (from ISR context)
+    BaseType_t xHigherPriorityTaskWoken = pdFALSE;
+    xQueueSendFromISR(g_button_event_queue, &evt, &xHigherPriorityTaskWoken);
+    if (xHigherPriorityTaskWoken == pdTRUE) {
+        portYIELD_FROM_ISR();
+    }
+}
+
+// Separate I2C initialization for ES8311 - old
+/*
+static esp_err_t init_i2c_for_es8311(void) {
+    ESP_LOGI(TAG, "Initializing I2C for ES8311...");
+    
+    // Configure I2C
+    i2c_config_t i2c_cfg = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_SDA_IO,
+        .scl_io_num = I2C_SCL_IO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,  // Enable internal pull-ups
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = 50000,  // Start with 50 kHz
+        .clk_flags = 0,
+    };
+    */
+// Separate I2C initialization for ES8311 - new
+static esp_err_t init_i2c_for_es8311(void) {
+    ESP_LOGI(TAG, "Initializing I2C for ES8311 with NEW master driver...");
+    
+    // Configuration for NEW I2C master driver
+    i2c_master_bus_config_t bus_config = {
+        .i2c_port = I2C_PORT_NUM,
+        .sda_io_num = I2C_SDA_IO,
+        .scl_io_num = I2C_SCL_IO,
+        .clk_source = I2C_CLK_SRC_DEFAULT,
+        .glitch_ignore_cnt = 7,
+        .flags.enable_internal_pullup = true, // Enable internal pull-ups
+    };
+    
+    esp_err_t ret = i2c_new_master_bus(&bus_config, &i2c_bus_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to create I2C bus: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    ESP_LOGI(TAG, "I2C master bus initialized on port %d", I2C_PORT_NUM);
+    return ESP_OK;
+}
+
+// I2C Scanner - to check the exact configuration of pins
+
+static void i2c_scanner(void) {
+    ESP_LOGI(TAG, "Starting I2C scanner on port %d, SDA:%d, SCL:%d...",
+             I2C_PORT_NUM, I2C_SDA_IO, I2C_SCL_IO);
+    i2c_cmd_handle_t cmd;
+    esp_err_t ret;
+    uint8_t found = 0;
+    
+    for (uint8_t addr = 1; addr < 127; addr++) {
+        cmd = i2c_cmd_link_create();
+        i2c_master_start(cmd);
+        i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
+        i2c_master_stop(cmd);
+        
+        ret = i2c_master_cmd_begin(I2C_PORT_NUM, cmd, 100 / portTICK_PERIOD_MS);
+        i2c_cmd_link_delete(cmd);
+        
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "Found device at address: 0x%02X", addr);
+            found++;
+            if (addr == ES8311_I2C_ADDR) {
+                ESP_LOGI(TAG, "  ^-- This is the ES8311 target address!");
+            }
+        } else if (ret == ESP_ERR_TIMEOUT) {
+            ESP_LOGW(TAG, "Timeout at address 0x%02X", addr);
+        }
+    }
+    if (found == 0) {
+        ESP_LOGW(TAG, "No I2C devices found. Check wiring/pull-ups.");
+    } else {
+        ESP_LOGI(TAG, "Scan complete. Found %d device(s).", found);
+    }
+}
+
+static esp_err_t scan_i2c_devices(void) {
+    ESP_LOGI(TAG, "Starting I2C bus scan...");
+    uint8_t found = 0;
+    
+    for (uint8_t addr = 1; addr < 127; addr++) {
+        i2c_device_config_t dev_cfg = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = addr,
+            .scl_speed_hz = 10000,  // VERY slow - 10 kHz for detection
+            .scl_wait_us = 20000,   // 20 ms timeout
+        };
+        
+        i2c_master_dev_handle_t temp_handle;
+        esp_err_t ret = i2c_master_bus_add_device(i2c_bus_handle, &dev_cfg, &temp_handle);
+        
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "✓ Found I2C device at address: 0x%02X", addr);
+            
+            // Test if it's ES8311 by reading chip ID
+            if (addr == ES8311_I2C_ADDR || addr == 0x19) {
+                uint8_t chip_id;
+                if (es8311_read_reg_new(0xFD, &chip_id) == ESP_OK) {
+                    ESP_LOGI(TAG, "  -> Confirmed ES8311! Chip ID: 0x%02X", chip_id);
+                }
+            }
+            
+            i2c_master_bus_rm_device(temp_handle);
+            found++;
+            vTaskDelay(pdMS_TO_TICKS(10)); // Small delay
+        }
+    }
+    
+    if (found == 0) {
+        ESP_LOGE(TAG, "✗ No I2C devices found!");
+        ESP_LOGE(TAG, "Check: 1) I2C pins 2) Power 3) Pull-up resistors");
+    } else {
+        ESP_LOGI(TAG, "Scan complete. Found %d device(s).", found);
+    }
+    
+    return (found > 0) ? ESP_OK : ESP_FAIL;
+}
+
+static esp_err_t try_alternative_i2c_pins(void) {
+    ESP_LOGI(TAG, "Testing alternative I2C pin configurations...");
+    
+    // List of possible I2C pin combinations for ESP32-S3
+    typedef struct {
+        int port;
+        int sda;
+        int scl;
+        const char* desc;
+    } i2c_pin_test_t;
+    
+    i2c_pin_test_t pin_configs[] = {
+        {0, 8, 9, "Default I2C0 (GPIO8/9)"},
+        {0, 6, 7, "Alternate I2C0 (GPIO6/7)"},
+        {1, 10, 11, "Default I2C1 (GPIO10/11) - YOUR CURRENT"},
+        {1, 2, 3, "Alternate I2C1 (GPIO2/3)"},
+        {0, 18, 19, "I2C0 (GPIO18/19)"},
+        {1, 20, 21, "I2C1 (GPIO20/21)"},
+    };
+    
+    for (int i = 0; i < sizeof(pin_configs)/sizeof(pin_configs[0]); i++) {
+        ESP_LOGI(TAG, "Testing: %s", pin_configs[i].desc);
+        
+        // Temporarily create I2C bus with these pins
+        i2c_master_bus_handle_t test_bus = NULL;
+        i2c_master_bus_config_t bus_config = {
+            .i2c_port = pin_configs[i].port,
+            .sda_io_num = pin_configs[i].sda,
+            .scl_io_num = pin_configs[i].scl,
+            .clk_source = I2C_CLK_SRC_DEFAULT,
+            .glitch_ignore_cnt = 7,
+            .flags.enable_internal_pullup = true,
+        };
+        
+        esp_err_t ret = i2c_new_master_bus(&bus_config, &test_bus);
+        if (ret != ESP_OK) {
+            ESP_LOGW(TAG, "  ✗ Failed to create bus");
+            continue;
+        }
+        
+        // Try to communicate with ES8311
+        i2c_device_config_t dev_cfg = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = ES8311_I2C_ADDR,
+            .scl_speed_hz = 10000,
+            .scl_wait_us = 10000,
+        };
+        
+        i2c_master_dev_handle_t test_dev;
+        ret = i2c_master_bus_add_device(test_bus, &dev_cfg, &test_dev);
+        if (ret == ESP_OK) {
+            uint8_t chip_id;
+            ret = i2c_master_transmit_receive(test_dev, (uint8_t[]){0xFD}, 1, &chip_id, 1, 100);
+            if (ret == ESP_OK) {
+                ESP_LOGI(TAG, "  ✓ SUCCESS! ES8311 found at 0x%02X, Chip ID: 0x%02X", 
+                        ES8311_I2C_ADDR, chip_id);
+                i2c_master_bus_rm_device(test_dev);
+                i2c_del_master_bus(test_bus);
+                return ESP_OK;
+            }
+            i2c_master_bus_rm_device(test_dev);
+        }
+        
+        i2c_del_master_bus(test_bus);
+        ESP_LOGW(TAG, "  ✗ No ES8311 response");
+    }
+    
+    return ESP_FAIL;
+}
+
+// Helper function to check the I2C Bus status
+static void check_i2c_bus_status(void) {
+    ESP_LOGI(TAG, "Checking I2C bus status...");
+    
+    // Test I2C by writing to a dummy address and checking for ACK
+    i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+    i2c_master_start(cmd);
+    i2c_master_write_byte(cmd, (ES8311_I2C_ADDR << 1) | I2C_MASTER_WRITE, true);
+    i2c_master_stop(cmd);
+    
+    esp_err_t ret = i2c_master_cmd_begin(I2C_PORT_NUM, cmd, 1000 / portTICK_PERIOD_MS);
+    i2c_cmd_link_delete(cmd);
+    
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "I2C bus seems operational. Device at 0x%02X responded.", ES8311_I2C_ADDR);
+    } else if (ret == ESP_ERR_TIMEOUT) {
+        ESP_LOGE(TAG, "I2C timeout - check SCL/SDA connections and pull-up resistors");
+    } else if (ret == ESP_FAIL) {
+        ESP_LOGE(TAG, "I2C NACK - device not responding at 0x%02X", ES8311_I2C_ADDR);
+    } else {
+        ESP_LOGE(TAG, "I2C error: %s (0x%x)", esp_err_to_name(ret), ret);
+    }
+    
+    // Check GPIO configuration
+    ESP_LOGI(TAG, "GPIO %d (SDA) and GPIO %d (SCL) should be configured for I2C", I2C_SDA_IO, I2C_SCL_IO);
+}
+
+// Check I2C with SDA pins
+static void simple_i2c_test(void) {
+    ESP_LOGI(TAG, "Simple I2C test: Toggling SDA pin...");
+    
+    // Configure SDA as output temporarily
+    gpio_set_direction(I2C_SDA_IO, GPIO_MODE_OUTPUT);
+    
+    for (int i = 0; i < 5; i++) {
+        gpio_set_level(I2C_SDA_IO, 1);
+        vTaskDelay(pdMS_TO_TICKS(100));
+        gpio_set_level(I2C_SDA_IO, 0);
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    
+    ESP_LOGI(TAG, "If you can see SDA toggling on scope/meter, GPIO is working");
+}
+
+// Helper: check which I2C ports are available
+static void check_i2c_ports(void) {
+    ESP_LOGI(TAG, "Available I2C ports on ESP32-S3:");
+    ESP_LOGI(TAG, "  I2C_NUM_0: GPIO6/SCL, GPIO7/SDA (default)");
+    ESP_LOGI(TAG, "  I2C_NUM_1: GPIO8/SCL, GPIO9/SDA (alternate)");
+    ESP_LOGI(TAG, "  Your pins: GPIO%d/SCL, GPIO%d/SDA", I2C_SCL_IO, I2C_SDA_IO);
+}
+
+// ============================
+// 3. INITIALIZE I2S PERIPHERAL (Data Path)
+// ============================
+/*
+static esp_err_t init_i2s_driver(void) {
+    ESP_LOGI(TAG, "Initializing I2S driver...");
+
+    // Channel configuration for Master role
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM, I2S_ROLE_MASTER);
+    chan_cfg.auto_clear = true;
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &i2s_tx_chan, &i2s_rx_chan));
+
+    // Standard configuration for 16kHz, 16-bit, mono
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(SAMPLE_BITS, I2S_SLOT_MODE_MONO),
+        .gpio_cfg = {
+            .mclk = I2S_MCK_IO,
+            .bclk = I2S_BCK_IO,
+            .ws = I2S_WS_IO,
+            .dout = I2S_DOUT_IO,
+            .din = I2S_DIN_IO,
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+    std_cfg.clk_cfg.mclk_multiple = MCLK_MULTIPLE;
+
+    // Initialize TX and RX channels
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(i2s_tx_chan, &std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(i2s_rx_chan, &std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_enable(i2s_tx_chan));
+    ESP_ERROR_CHECK(i2s_channel_enable(i2s_rx_chan));
+
+    ESP_LOGI(TAG, "I2S driver initialized at %d Hz, %d-bit, mono.", SAMPLE_RATE, SAMPLE_BITS);
+    return ESP_OK;
+}
+    */
+static esp_err_t init_i2s_driver(void) {
+    ESP_LOGI(TAG, "Initializing I2S driver...");
+
+    // Channel configuration
+    i2s_chan_config_t chan_cfg = I2S_CHANNEL_DEFAULT_CONFIG(I2S_NUM, I2S_ROLE_MASTER);
+    chan_cfg.auto_clear = true;
+    ESP_ERROR_CHECK(i2s_new_channel(&chan_cfg, &i2s_tx_chan, &i2s_rx_chan));
+
+    // Standard configuration - IMPORTANT CHANGES BELOW
+    i2s_std_config_t std_cfg = {
+        .clk_cfg = I2S_STD_CLK_DEFAULT_CONFIG(SAMPLE_RATE),
+        // For ES8311, use STEREO mode even if you want mono
+        .slot_cfg = I2S_STD_PHILIPS_SLOT_DEFAULT_CONFIG(SAMPLE_BITS, I2S_SLOT_MODE_STEREO),
+        .gpio_cfg = {
+            .mclk = I2S_MCK_IO,
+            .bclk = I2S_BCK_IO,
+            .ws = I2S_WS_IO,
+            .dout = I2S_DO_IO,  // Use corrected name
+            .din = I2S_DI_IO,   // Use corrected name
+            .invert_flags = {
+                .mclk_inv = false,
+                .bclk_inv = false,
+                .ws_inv = false,
+            },
+        },
+    };
+    std_cfg.clk_cfg.mclk_multiple = MCLK_MULTIPLE;
+
+    // Initialize channels
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(i2s_tx_chan, &std_cfg));
+    ESP_ERROR_CHECK(i2s_channel_init_std_mode(i2s_rx_chan, &std_cfg));
+    
+    ESP_LOGI(TAG, "I2S driver initialized at %d Hz, %d-bit.", SAMPLE_RATE, SAMPLE_BITS);
+    return ESP_OK;
+}
+
+// ============================
+// 4. INITIALIZE ES8311 CODEC
+// ============================
+/*
+static esp_err_t init_es8311_codec(void) {
+    ESP_LOGI(TAG, "Initializing ES8311 codec using Waveshare example pattern...");
+    
+    // 1. Initialize I2C (from your example)
+    i2c_config_t i2c_cfg = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_SDA_IO,
+        .scl_io_num = I2C_SCL_IO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = 100000,
+    };
+    
+    ESP_ERROR_CHECK(i2c_param_config(I2C_PORT_NUM, &i2c_cfg));
+    ESP_ERROR_CHECK(i2c_driver_install(I2C_PORT_NUM, I2C_MODE_MASTER, 0, 0, 0));
+    // Scan the I2C bus befor attempting to connect
+    i2c_scanner(); 
+    
+    // 2. Create ES8311 handle using the function from your es8311.h
+    // Based on your example: es8311_handle_t es_handle = es8311_create(I2C_NUM, ES8311_ADDRRES_0);
+    es8311_handle_t es_handle = es8311_create(I2C_PORT_NUM, ES8311_I2C_ADDR);
+    if (es_handle == NULL) {
+        ESP_LOGE(TAG, "es8311 create failed");
+        return ESP_FAIL;
+    }
+    
+    // 3. Configure clock (from your example)
+    es8311_clock_config_t es_clk = {
+        .mclk_inverted = false,
+        .sclk_inverted = false,
+        .mclk_from_mclk_pin = true,
+        .mclk_frequency = SAMPLE_RATE * MCLK_MULTIPLE,
+        .sample_frequency = SAMPLE_RATE
+    };
+    
+    // 4. Initialize ES8311 (from your example)
+    ESP_ERROR_CHECK(es8311_init(es_handle, &es_clk, ES8311_RESOLUTION_16, ES8311_RESOLUTION_16));
+    
+    // 5. Configure sample frequency (from your example)
+    ESP_ERROR_CHECK(es8311_sample_frequency_config(es_handle, 
+                   SAMPLE_RATE * MCLK_MULTIPLE, 
+                   SAMPLE_RATE));
+    
+    // 6. Set volume (from your example)
+    ESP_ERROR_CHECK(es8311_voice_volume_set(es_handle, 60, NULL));
+    
+    // 7. Enable microphone (from your example)
+    ESP_ERROR_CHECK(es8311_microphone_config(es_handle, false));
+    
+    // 8. Set microphone gain (from your example)
+    ESP_ERROR_CHECK(es8311_microphone_gain_set(es_handle, 5));
+    
+    ESP_LOGI(TAG, "ES8311 codec initialized successfully using Waveshare pattern.");
+    return ESP_OK;
+}
+*/
+
+// init_es8311_codec() - old
+/*
+static esp_err_t init_es8311_codec(void) {
+    ESP_LOGI(TAG, "Initializing ES8311 codec...");
+    
+    // 2. Scan I2C bus
+    i2c_scanner(); 
+    
+    // 3. Create ES8311 handle
+    es8311_handle_t es_handle = es8311_create(I2C_PORT_NUM, ES8311_I2C_ADDR);
+    if (es_handle == NULL) {
+        ESP_LOGE(TAG, "es8311 create failed");
+        return ESP_FAIL;
+    }
+    
+    // 4. Configure clock
+    es8311_clock_config_t es_clk = {
+        .mclk_inverted = false,
+        .sclk_inverted = false,
+        .mclk_from_mclk_pin = true,
+        .mclk_frequency = SAMPLE_RATE * 256,  // Fixed: 48000 * 256 = 12.288 MHz
+        .sample_frequency = SAMPLE_RATE
+    };
+    
+    // 5. Initialize ES8311 with 16-bit resolution for both input and output
+    esp_err_t ret = es8311_init(es_handle, &es_clk, ES8311_RESOLUTION_16, ES8311_RESOLUTION_16);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "es8311_init failed: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    // 6. Set volume (0-100)
+    ret = es8311_voice_volume_set(es_handle, 60, NULL);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set volume: %s", esp_err_to_name(ret));
+    }
+    
+    // 7. Configure microphone (analog)
+    ret = es8311_microphone_config(es_handle, false);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to configure microphone: %s", esp_err_to_name(ret));
+    }
+    
+    // 8. Set microphone gain (0-8)
+    ret = es8311_microphone_gain_set(es_handle, ES8311_MIC_GAIN_30DB);
+    if (ret != ESP_OK) {
+        ESP_LOGW(TAG, "Failed to set mic gain: %s", esp_err_to_name(ret));
+    }
+    
+    ESP_LOGI(TAG, "ES8311 codec initialized.");
+    return ESP_OK;
+}
+*/
+
+// Initialize ES8311 device on the I2C bus
+static esp_err_t init_es8311_device(void) {
+    ESP_LOGI(TAG, "Initializing ES8311 device on I2C bus...");
+    
+    i2c_device_config_t dev_cfg = {
+        .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+        .device_address = ES8311_I2C_ADDR,
+        .scl_speed_hz = 50000,  // Start with 50 kHz
+        .scl_wait_us = 10000,   // 10 ms wait time
+    };
+    
+    esp_err_t ret = i2c_master_bus_add_device(i2c_bus_handle, &dev_cfg, &es8311_dev_handle);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to add ES8311 device to I2C bus: %s", esp_err_to_name(ret));
+        return ret;
+    }
+    
+    // Test communication
+    uint8_t chip_id = 0;
+    ret = es8311_read_reg_new(0xFD, &chip_id); // Read CHIP ID1
+    if (ret == ESP_OK) {
+        ESP_LOGI(TAG, "ES8311 detected! Chip ID1: 0x%02x", chip_id);
+        return ESP_OK;
+    }
+    
+    ESP_LOGE(TAG, "ES8311 not responding");
+    return ret;
+}
+
+// init_es8311_codec() - new
+static esp_err_t init_es8311_codec(void) {
+    ESP_LOGI(TAG, "Initializing ES8311 codec...");
+    
+    // Initialize ES8311 device on I2C bus
+    esp_err_t ret = init_es8311_device();
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize ES8311 device");
+        return ret;
+    }
+    
+    // Note: We can't use the original es8311_create() because it uses legacy I2C
+    // Instead, we'll directly configure ES8311 using our new I2C functions
+    
+    // Configure ES8311 registers manually (simplified example)
+    ESP_LOGI(TAG, "Configuring ES8311 registers...");
+    
+    // Reset ES8311
+    es8311_write_reg_new(0x00, 0x1F); // Reset
+    vTaskDelay(pdMS_TO_TICKS(20));
+    es8311_write_reg_new(0x00, 0x00);
+    es8311_write_reg_new(0x00, 0x80); // Power-on
+    
+    // Basic configuration
+    es8311_write_reg_new(0x0D, 0x01); // Power up analog
+    es8311_write_reg_new(0x0E, 0x02); // Enable PGA and ADC
+    es8311_write_reg_new(0x12, 0x00); // Power-up DAC
+    es8311_write_reg_new(0x13, 0x10); // Enable HP drive
+    
+    // Set volume
+    es8311_write_reg_new(0x32, 0x80); // Volume ~50%
+    
+    ESP_LOGI(TAG, "ES8311 basic configuration complete");
+    return ESP_OK;
+}
+
+// ============================
+// HELPER: Generate a sine wave beep
+// ============================
+
+// Mono
+/*
+static void generate_beep(int16_t *buffer, size_t num_samples, uint32_t freq, uint32_t sample_rate) {
+    for (size_t i = 0; i < num_samples; i++) {
+        buffer[i] = (int16_t)(30000.0 * sin(2 * M_PI * freq * i / sample_rate)); // 30k amplitude
+    }
+}
+*/
+// Stereo
+static void generate_beep(int16_t *buffer, size_t num_samples, uint32_t freq, uint32_t sample_rate) {
+    // Generate stereo beep (left and right channels)
+    for (size_t i = 0; i < num_samples; i += 2) {
+        int16_t sample = (int16_t)(15000.0 * sin(2 * M_PI * freq * (i/2) / sample_rate));
+        buffer[i] = sample;     // Left channel
+        buffer[i+1] = sample;   // Right channel (same for mono beep)
+    }
+}
+
+// ============================
+// HELPER: Calculate RMS of audio samples
+// ============================
+static float calculate_rms(int16_t *samples, size_t count) {
+    int64_t sum = 0;
+    for (size_t i = 0; i < count; i++) {
+        sum += (int64_t)samples[i] * samples[i];
+    }
+    return sqrtf((float)sum / count);
+}
+
+// ============================
+// TASK: Play a beep (1000 Hz, 1 sec)
+// ============================
+
+// Mono
+/*
+static void beep_task(void *pvParameters) {
+    size_t beep_samples = SAMPLE_RATE * BEEP_DURATION_MS / 1000;
+    int16_t *beep_buffer = malloc(beep_samples * sizeof(int16_t));
+    if (beep_buffer == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate beep buffer");
+        vTaskDelete(NULL);
+    }
+
+    generate_beep(beep_buffer, beep_samples, BEEP_FREQ, SAMPLE_RATE);
+    ESP_LOGI(TAG, "Playing beep (%d Hz, %d ms)...", BEEP_FREQ, BEEP_DURATION_MS);
+
+    // Use I2S write directly since we're not using esp_codec_dev
+    size_t bytes_written = 0;
+    i2s_channel_write(i2s_tx_chan, beep_buffer, beep_samples * sizeof(int16_t), &bytes_written, portMAX_DELAY);
+
+    free(beep_buffer);
+    ESP_LOGI(TAG, "Beep finished.");
+    vTaskDelete(NULL);
+}
+*/
+
+// Stereo
+static void beep_task(void *pvParameters) {
+    size_t beep_samples = (SAMPLE_RATE * BEEP_DURATION_MS / 1000) * 2; // Stereo
+    int16_t *beep_buffer = malloc(beep_samples * sizeof(int16_t));
+    if (beep_buffer == NULL) {
+        ESP_LOGE(TAG, "Failed to allocate beep buffer");
+        vTaskDelete(NULL);
+        return;
+    }
+
+    generate_beep(beep_buffer, beep_samples, BEEP_FREQ, SAMPLE_RATE);
+    ESP_LOGI(TAG, "Playing beep (%d Hz, %d ms)...", BEEP_FREQ, BEEP_DURATION_MS);
+
+    size_t bytes_written = 0;
+    esp_err_t ret = i2s_channel_write(i2s_tx_chan, beep_buffer, 
+                                      beep_samples * sizeof(int16_t), 
+                                      &bytes_written, portMAX_DELAY);
+    
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Beep playback failed: %s", esp_err_to_name(ret));
+    } else {
+        ESP_LOGI(TAG, "Beep finished, wrote %d bytes", bytes_written);
+    }
+    
+    free(beep_buffer);
+    vTaskDelete(NULL);
+}
+
+// ============================
+// TASK: Record audio until silence
+// ============================
+static void record_audio_task(void *pvParameters) {
+    int16_t read_buffer[REC_BUFFER_SIZE];
+    g_recorded_samples = 0;
+    g_is_recording = true;
+    uint32_t silence_start_time = 0;
+    bool silence_detected = false;
+
+    ESP_LOGI(TAG, "Recording started... Speak into the microphone.");
+
+    while (g_is_recording && g_recorded_samples < SAMPLES_TO_REC) {
+        size_t bytes_read = 0;
+        i2s_channel_read(i2s_rx_chan, read_buffer, sizeof(read_buffer), &bytes_read, pdMS_TO_TICKS(100));
+        size_t samples_read = bytes_read / sizeof(int16_t);
+
+        if (samples_read > 0) {
+            float rms = calculate_rms(read_buffer, samples_read);
+
+            if (rms < SILENCE_THRESHOLD) {
+                if (!silence_detected) {
+                    silence_detected = true;
+                    silence_start_time = xTaskGetTickCount() * portTICK_PERIOD_MS; // FIXED LINE
+                    ESP_LOGI(TAG, "Silence detected, starting timer...");
+                } else if ((xTaskGetTickCount() * portTICK_PERIOD_MS - silence_start_time) >= SILENCE_DURATION_MS) {
+                    ESP_LOGI(TAG, "Silence duration exceeded. Stopping recording.");
+                    g_is_recording = false;
+                    break;
+                }
+            } else {
+                silence_detected = false;
+            }
+
+            memcpy(&g_audio_buffer[g_recorded_samples], read_buffer, samples_read * sizeof(int16_t));
+            g_recorded_samples += samples_read;
+            ESP_LOGI(TAG, "Recorded: %"PRIu32" samples (%.1f s)",
+                     g_recorded_samples, (float)g_recorded_samples / SAMPLE_RATE);
+        }
+    }
+    
+    g_is_recording = false;
+    g_audio_ready = (g_recorded_samples > SAMPLE_RATE);
+    ESP_LOGI(TAG, "Recording stopped. Total samples: %"PRIu32". Audio ready: %s",
+             g_recorded_samples, g_audio_ready ? "YES" : "NO");
+    vTaskDelete(NULL);
+}
+
+// ============================
+// TASK: Playback recorded audio or beeps
+// ============================
+static void playback_audio_task(void *pvParameters) {
+    if (!g_audio_ready || g_recorded_samples == 0) {
+        ESP_LOGW(TAG, "No valid audio recorded. Playing two beeps instead.");
+        // Play first beep
+        beep_task(NULL);
+        vTaskDelay(pdMS_TO_TICKS(100)); // Short gap
+        // Play second beep
+        beep_task(NULL);
+    } else {
+        ESP_LOGI(TAG, "Playing back recorded audio (%"PRIu32" samples)...", g_recorded_samples);
+        // Use I2S write directly
+        size_t bytes_written = 0;
+        i2s_channel_write(i2s_tx_chan, g_audio_buffer, 
+                         g_recorded_samples * sizeof(int16_t), 
+                         &bytes_written, portMAX_DELAY);
+        ESP_LOGI(TAG, "Playback finished.");
+    }
+    vTaskDelete(NULL);
+}
+
+// ============================
+// PSRAM Availability check
+// ============================
+
+static void check_psram_status(void) {
+    ESP_LOGI(TAG, "Checking memory configuration...");
+    
+    // Check total heap
+    ESP_LOGI(TAG, "Total heap: %d bytes", esp_get_free_heap_size());
+    
+    // Check largest free block
+    ESP_LOGI(TAG, "Largest free block: %d bytes", heap_caps_get_largest_free_block(MALLOC_CAP_DEFAULT));
+    
+    // Check if PSRAM is available
+    if (heap_caps_get_free_size(MALLOC_CAP_SPIRAM) > 0) {
+        ESP_LOGI(TAG, "PSRAM is available: %d bytes free", heap_caps_get_free_size(MALLOC_CAP_SPIRAM));
+    } else {
+        ESP_LOGE(TAG, "PSRAM is NOT available or not initialized!");
+    }
+    
+    // Test PSRAM allocation
+    void *test_psram = heap_caps_malloc(1024, MALLOC_CAP_SPIRAM);
+    if (test_psram) {
+        ESP_LOGI(TAG, "PSRAM test allocation successful");
+        free(test_psram);
+    } else {
+        ESP_LOGE(TAG, "PSRAM test allocation FAILED");
+    }
+}
+
+// Update your app_main() cleanup
+void cleanup_resources(void) {
+    if (es_handle != NULL) {
+        es8311_delete_new_i2c(es_handle);
+        es_handle = NULL;
+    }
+    if (i2c_bus_handle != NULL) {
+        i2c_del_master_bus(i2c_bus_handle);
+        i2c_bus_handle = NULL;
+    }
+}
+
+// ============================
+// MAIN APPLICATION
+// ============================
+
+/*
+void app_main(void) {
+        ESP_LOGI(TAG, "\n\n=== ESP32-S3 Audio Recorder/Player ===\n");
+    
+    // 2. Initialize PSRAM buffer
+    if (init_psram_buffer() != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to allocate PSRAM buffer");
+        return;
+    }
+
+    // 1. Enable Power Amplifier
+    enable_power_amplifier();
+
+    // 2. Initialize I2C (NEW driver only)
+    if (init_i2c_for_es8311() != ESP_OK) {
+        ESP_LOGE(TAG, "I2C init failed");
+        return;
+    }
+
+    // 5. Scan for ANY I2C devices
+    ESP_LOGI(TAG, "\nStep 4: Scanning I2C bus...");
+    if (scan_i2c_devices() != ESP_OK) {
+        ESP_LOGE(TAG, "No I2C devices detected.");
+        ESP_LOGI(TAG, "\nTroubleshooting checklist:");
+        ESP_LOGI(TAG, "1. Check physical connections to ES8311");
+        ESP_LOGI(TAG, "2. Verify 3.3V power to ES8311");
+        ESP_LOGI(TAG, "3. Add 4.7kΩ pull-up resistors on SDA/SCL");
+        ESP_LOGI(TAG, "4. Check I2C pins on board schematic");
+    }
+
+    ESP_LOGI(TAG, "\nDiagnostic complete.");
+    
+    // 3. Initialize ES8311
+    if (init_es8311_codec() != ESP_OK) {
+        ESP_LOGE(TAG, "ES8311 init failed");
+    } else {
+        ESP_LOGI(TAG, "ES8311 initialized successfully!");
+    }
+    
+    // 4. Initialize I2S (optional for now)
+    // if (init_i2s_driver() != ESP_OK) {
+    //     ESP_LOGE(TAG, "I2S init failed");
+    //     return;
+    // }
+    
+    ESP_LOGI(TAG, "System ready. Audio should work now.");
+    
+    // 3. Initialize buttons
+    if (init_buttons() != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize buttons");
+        return;
+    }
+    
+    // 5. Run I2C diagnostics
+    
+    // check_i2c_ports();
+    // check_i2c_bus_status();
+    // simple_i2c_test();
+    // i2c_scanner();
+    
+    ESP_LOGI(TAG, "System initialization complete. Press buttons to control.");
+    ESP_LOGI(TAG, "  - Button on GPIO%d: Record (with start beep)", BUTTON_REC_GPIO);
+    ESP_LOGI(TAG, "  - Button on GPIO%d: Playback", BUTTON_PLAY_GPIO);
+    ESP_LOGI(TAG, "Waiting for button events...\n");
+
+    // Main loop: Wait for and handle button events from the queue
+    button_event_t evt;
+    while (1) {
+        if (xQueueReceive(g_button_event_queue, &evt, portMAX_DELAY)) {
+            switch (evt) {
+                case BUTTON_REC_EVENT:
+                    ESP_LOGI(TAG, "[ACTION] Record button pressed.");
+                    if (g_is_recording) {
+                        ESP_LOGW(TAG, "Already recording. Ignoring.");
+                    } else {
+                        // 1. Play a start beep
+                        xTaskCreate(beep_task, "beep_task", 2048, NULL, 5, NULL);
+                        vTaskDelay(pdMS_TO_TICKS(BEEP_DURATION_MS + 100)); // Wait for beep to finish
+                        // 2. Start recording task
+                        xTaskCreate(record_audio_task, "record_task", 4096, NULL, 6, NULL);
+                    }
+                    break;
+
+                case BUTTON_PLAY_EVENT:
+                    ESP_LOGI(TAG, "[ACTION] Playback button pressed.");
+                    // Start playback task (it will handle the case of no recorded audio)
+                    xTaskCreate(playback_audio_task, "playback_task", 4096, NULL, 5, NULL);
+                    break;
+
+                default:
+                    break;
+            }
+        }
+    }
+}
+*/
+
+// diagnostic app_main()
+/*
+void app_main(void) {
+    ESP_LOGI(TAG, "=== I2C Hardware Diagnostic ===");
+    // 1. Power on ES8311
+    enable_power_amplifier(); // PA_EN high
+    vTaskDelay(pdMS_TO_TICKS(100)); // Wait for power stability
+
+    // 2. Initialize ONLY I2C (do NOT call I2S init)
+    if (init_i2c_for_es8311() != ESP_OK) {
+        ESP_LOGE(TAG, "I2C init failed.");
+        return;
+    }
+
+    ESP_LOGI(TAG, "Running minimal I2C device scan...");
+    uint8_t found_count = 0;
+    for (uint8_t addr = 0x08; addr <= 0x77; addr++) { // Scan only valid range
+        i2c_device_config_t dev_cfg = {
+            .dev_addr_length = I2C_ADDR_BIT_LEN_7,
+            .device_address = addr,
+            .scl_speed_hz = 50000, // Slow
+        };
+        i2c_master_dev_handle_t test_handle;
+        esp_err_t ret = i2c_master_bus_add_device(i2c_bus_handle, &dev_cfg, &test_handle);
+        if (ret == ESP_OK) {
+            // Device ACKed the address
+            ESP_LOGW(TAG, "Minimal scan found something at 0x%02X", addr);
+            found_count++;
+            i2c_master_bus_rm_device(test_handle);
+        }
+    }
+    ESP_LOGI(TAG, "Minimal scan found %d potential devices.", found_count);
+    // Use your updated scanner
+    // ESP_LOGI(TAG, "I2C bus initialized. Running scanner...");
+    // Minimal I2C test after init_i2c_for_es8311()
+    //scan_i2c_devices(); 
+    // If the scanner still shows 126 devices, the hardware fault is confirmed.
+}
+*/
+
+/*
+void app_main(void) {
+    ESP_LOGI(TAG, "=== ESP32-S3 Audio Recorder/Player - FIXED VERSION ===");
+    
+    // 1. First, check if we have proper pull-up resistors
+    ESP_LOGI(TAG, "Checking I2C bus configuration...");
+    
+    // Temporarily configure SDA and SCL as inputs to check their state
+    gpio_set_direction(I2C_SDA_IO, GPIO_MODE_INPUT);
+    gpio_set_direction(I2C_SCL_IO, GPIO_MODE_INPUT);
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    int sda_level = gpio_get_level(I2C_SDA_IO);
+    int scl_level = gpio_get_level(I2C_SCL_IO);
+    
+    ESP_LOGI(TAG, "SDA (GPIO%d) level: %d (should be 1 with pull-up)", I2C_SDA_IO, sda_level);
+    ESP_LOGI(TAG, "SCL (GPIO%d) level: %d (should be 1 with pull-up)", I2C_SCL_IO, scl_level);
+    
+    if (sda_level == 0 || scl_level == 0) {
+        ESP_LOGE(TAG, "ERROR: SDA or SCL is LOW! This indicates missing pull-up resistors.");
+        ESP_LOGE(TAG, "You need 4.7kΩ pull-up resistors from SDA/SCL to 3.3V!");
+        ESP_LOGE(TAG, "Without pull-ups, the I2C bus cannot function properly.");
+    } else {
+        ESP_LOGI(TAG, "Good: SDA and SCL are HIGH (pull-ups present)");
+    }
+    
+    // 2. Enable Power Amplifier
+    ESP_LOGI(TAG, "Enabling power amplifier...");
+    enable_power_amplifier();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    // 3. Initialize I2C with proper configuration
+    ESP_LOGI(TAG, "Initializing I2C...");
+    
+    // Try the old I2C driver FIRST (since the example uses it successfully)
+    ESP_LOGI(TAG, "Using LEGACY I2C driver (compatible with example code)...");
+    
+    i2c_config_t i2c_cfg = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_SDA_IO,
+        .scl_io_num = I2C_SCL_IO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,  // Enable INTERNAL pull-ups
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = 50000,  // Start slow: 50 kHz
+    };
+    
+    esp_err_t ret = i2c_param_config(I2C_PORT_NUM, &i2c_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure I2C parameters: %s", esp_err_to_name(ret));
+        return;
+    }
+    
+    ret = i2c_driver_install(I2C_PORT_NUM, I2C_MODE_MASTER, 0, 0, 0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to install I2C driver: %s", esp_err_to_name(ret));
+        return;
+    }
+    
+    // 4. Simple I2C scanner to verify communication
+    ESP_LOGI(TAG, "Running I2C scanner...");
+    
+    uint8_t found = 0;
+    for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+        i2c_master_start(cmd);
+        i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
+        i2c_master_stop(cmd);
+        
+        ret = i2c_master_cmd_begin(I2C_PORT_NUM, cmd, 50 / portTICK_PERIOD_MS);
+        i2c_cmd_link_delete(cmd);
+        
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "✓ Found device at address: 0x%02X", addr);
+            found++;
+            
+            // Test if it's ES8311 by trying to read its ID
+            if (addr == 0x18 || addr == 0x19) {
+                uint8_t data;
+                i2c_cmd_handle_t cmd2 = i2c_cmd_link_create();
+                i2c_master_start(cmd2);
+                i2c_master_write_byte(cmd2, (addr << 1) | I2C_MASTER_WRITE, true);
+                i2c_master_write_byte(cmd2, 0xFD, true);  // CHIP ID1 register
+                i2c_master_start(cmd2);  // Repeated start
+                i2c_master_write_byte(cmd2, (addr << 1) | I2C_MASTER_READ, true);
+                i2c_master_read_byte(cmd2, &data, I2C_MASTER_NACK);
+                i2c_master_stop(cmd2);
+                
+                ret = i2c_master_cmd_begin(I2C_PORT_NUM, cmd2, 100 / portTICK_PERIOD_MS);
+                i2c_cmd_link_delete(cmd2);
+                
+                if (ret == ESP_OK) {
+                    ESP_LOGI(TAG, "  → ES8311 Chip ID: 0x%02X", data);
+                }
+            }
+        }
+    }
+    
+    if (found == 0) {
+        ESP_LOGW(TAG, "No I2C devices found.");
+        ESP_LOGI(TAG, "\nTROUBLESHOOTING:");
+        ESP_LOGI(TAG, "1. Check SDA/SCL connections (GPIO%d/GPIO%d)", I2C_SDA_IO, I2C_SCL_IO);
+        ESP_LOGI(TAG, "2. Add 4.7kΩ external pull-up resistors to 3.3V");
+        ESP_LOGI(TAG, "3. Verify ES8311 is powered (3.3V and GND)");
+        ESP_LOGI(TAG, "4. Check I2C address jumpers on ES8311 board");
+        ESP_LOGI(TAG, "5. Try alternative I2C pins: GPIO8/9 or GPIO2/3");
+    } else if (found > 20) {
+        ESP_LOGW(TAG, "Found %d devices - this is suspicious!", found);
+        ESP_LOGI(TAG, "Too many devices detected. Likely I2C bus issue:");
+        ESP_LOGI(TAG, "- Missing pull-up resistors (add 4.7kΩ)");
+        ESP_LOGI(TAG, "- Bus capacitance too high (use shorter wires)");
+        ESP_LOGI(TAG, "- Ground loop or noise issue");
+    } else {
+        ESP_LOGI(TAG, "Found %d device(s) - normal", found);
+    }
+    
+    // 5. If ES8311 was found, initialize it using the WORKING example code pattern
+    if (found > 0 && found <= 20) {  // Reasonable number of devices
+        ESP_LOGI(TAG, "\nInitializing ES8311 using example code pattern...");
+        
+        // Create ES8311 handle using the SAME function as the working example
+        es8311_handle_t es_handle = es8311_create(I2C_PORT_NUM, 0x18);
+        if (es_handle == NULL) {
+            ESP_LOGE(TAG, "Failed to create ES8311 handle");
+        } else {
+            ESP_LOGI(TAG, "ES8311 handle created");
+            
+            // Configure exactly like the working example
+            const es8311_clock_config_t es_clk = {
+                .mclk_inverted = false,
+                .sclk_inverted = false,
+                .mclk_from_mclk_pin = true,
+                .mclk_frequency = 12288000,  // 48kHz * 256 = 12.288 MHz
+                .sample_frequency = 48000
+            };
+            
+            ret = es8311_init(es_handle, &es_clk, ES8311_RESOLUTION_16, ES8311_RESOLUTION_16);
+            if (ret == ESP_OK) {
+                ESP_LOGI(TAG, "ES8311 initialized successfully!");
+                
+                // Set volume
+                es8311_voice_volume_set(es_handle, 60, NULL);
+                ESP_LOGI(TAG, "Volume set to 60");
+                
+                // Play a test beep
+                ESP_LOGI(TAG, "Playing test beep...");
+                xTaskCreate(beep_task, "beep_task", 2048, NULL, 5, NULL);
+            } else {
+                ESP_LOGE(TAG, "ES8311 init failed: %s", esp_err_to_name(ret));
+            }
+        }
+    }
+    
+    ESP_LOGI(TAG, "\n=== Diagnostic Complete ===");
+}
+    */
+
+void app_main(void) {
+    ESP_LOGI(TAG, "=== ESP32-S3 Audio Recorder/Player - OLD I2C DRIVER ===");
+    
+    // 1. Enable Power Amplifier
+    ESP_LOGI(TAG, "Enabling power amplifier...");
+    enable_power_amplifier();
+    vTaskDelay(pdMS_TO_TICKS(100));
+    
+    // 2. Initialize I2C using OLD driver (like the example)
+    ESP_LOGI(TAG, "Initializing I2C (OLD driver)...");
+    
+    i2c_config_t i2c_cfg = {
+        .mode = I2C_MODE_MASTER,
+        .sda_io_num = I2C_SDA_IO,
+        .scl_io_num = I2C_SCL_IO,
+        .sda_pullup_en = GPIO_PULLUP_ENABLE,
+        .scl_pullup_en = GPIO_PULLUP_ENABLE,
+        .master.clk_speed = 50000,  // Start slow: 50 kHz
+    };
+    
+    esp_err_t ret = i2c_param_config(I2C_PORT_NUM, &i2c_cfg);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to configure I2C parameters: %s", esp_err_to_name(ret));
+        return;
+    }
+    
+    ret = i2c_driver_install(I2C_PORT_NUM, I2C_MODE_MASTER, 0, 0, 0);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to install I2C driver: %s", esp_err_to_name(ret));
+        return;
+    }
+    
+    // 3. Check I2C bus status BEFORE scanning
+    ESP_LOGI(TAG, "Checking I2C bus...");
+    
+    // Check SDA/SCL levels
+    // gpio_set_direction(I2C_SDA_IO, GPIO_MODE_INPUT);
+    // gpio_set_direction(I2C_SCL_IO, GPIO_MODE_INPUT);
+    // vTaskDelay(pdMS_TO_TICKS(10));
+
+    // After i2c_driver_install
+    gpio_set_direction(I2C_SDA_IO, GPIO_MODE_INPUT);
+    gpio_set_direction(I2C_SCL_IO, GPIO_MODE_INPUT);
+    vTaskDelay(100);
+    printf("SDA: %d, SCL: %d\n", 
+        gpio_get_level(I2C_SDA_IO), 
+        gpio_get_level(I2C_SCL_IO));
+    
+    int sda_state = gpio_get_level(I2C_SDA_IO);
+    int scl_state = gpio_get_level(I2C_SCL_IO);
+    
+    ESP_LOGI(TAG, "SDA state: %d, SCL state: %d", sda_state, scl_state);
+    if (sda_state == 0 || scl_state == 0) {
+        ESP_LOGE(TAG, "I2C bus stuck LOW! Missing pull-up resistors.");
+    }
+    
+    // 4. Simple I2C scan
+    ESP_LOGI(TAG, "Scanning I2C bus...");
+    
+    uint8_t found = 0;
+    for (uint8_t addr = 0x08; addr <= 0x77; addr++) {
+        i2c_cmd_handle_t cmd = i2c_cmd_link_create();
+        i2c_master_start(cmd);
+        i2c_master_write_byte(cmd, (addr << 1) | I2C_MASTER_WRITE, true);
+        i2c_master_stop(cmd);
+        
+        ret = i2c_master_cmd_begin(I2C_PORT_NUM, cmd, 50 / portTICK_PERIOD_MS);
+        i2c_cmd_link_delete(cmd);
+        
+        if (ret == ESP_OK) {
+            ESP_LOGI(TAG, "Found device at: 0x%02X", addr);
+            found++;
+            
+            // Try to identify ES8311
+            if (addr == 0x18 || addr == 0x19) {
+                uint8_t reg_value;
+                i2c_cmd_handle_t cmd2 = i2c_cmd_link_create();
+                i2c_master_start(cmd2);
+                i2c_master_write_byte(cmd2, (addr << 1) | I2C_MASTER_WRITE, true);
+                i2c_master_write_byte(cmd2, 0xFD, true);  // CHIP ID1 register
+                i2c_master_start(cmd2);  // Repeated start
+                i2c_master_write_byte(cmd2, (addr << 1) | I2C_MASTER_READ, true);
+                i2c_master_read_byte(cmd2, &reg_value, I2C_MASTER_NACK);
+                i2c_master_stop(cmd2);
+                
+                ret = i2c_master_cmd_begin(I2C_PORT_NUM, cmd2, 100 / portTICK_PERIOD_MS);
+                i2c_cmd_link_delete(cmd2);
+                
+                if (ret == ESP_OK) {
+                    ESP_LOGI(TAG, "  -> ES8311 Chip ID1: 0x%02X", reg_value);
+                }
+            }
+        }
+    }
+    
+    ESP_LOGI(TAG, "Found %d I2C device(s)", found);
+    
+    if (found == 0) {
+        ESP_LOGE(TAG, "No I2C devices found!");
+        ESP_LOGI(TAG, "\nTroubleshooting:");
+        ESP_LOGI(TAG, "1. Add 4.7kΩ pull-up resistors from SDA/SCL to 3.3V");
+        ESP_LOGI(TAG, "2. Check wiring: SDA->GPIO%d, SCL->GPIO%d", I2C_SDA_IO, I2C_SCL_IO);
+        ESP_LOGI(TAG, "3. Verify ES8311 has 3.3V power");
+        return;
+    }
+    
+    if (found > 20) {
+        ESP_LOGW(TAG, "Too many devices (%d) - bus likely floating", found);
+    }
+    
+    // 5. Initialize ES8311 using the OLD driver functions
+    ESP_LOGI(TAG, "\nInitializing ES8311...");
+    
+    // Use the exact same pattern as the working example
+    es8311_handle_t es_handle = es8311_create(I2C_PORT_NUM, 0x18);
+    if (es_handle == NULL) {
+        ESP_LOGE(TAG, "Failed to create ES8311 handle");
+        return;
+    }
+    
+    // Use the exact same configuration as the example
+    const es8311_clock_config_t es_clk = {
+        .mclk_inverted = false,
+        .sclk_inverted = false,
+        .mclk_from_mclk_pin = true,
+        .mclk_frequency = 12288000,  // 48kHz * 256 = 12.288 MHz
+        .sample_frequency = 48000
+    };
+    
+    ret = es8311_init(es_handle, &es_clk, ES8311_RESOLUTION_16, ES8311_RESOLUTION_16);
+    if (ret != ESP_OK) {
+        ESP_LOGE(TAG, "ES8311 init failed: %s", esp_err_to_name(ret));
+        return;
+    }
+    
+    // Set volume (0-100)
+    es8311_voice_volume_set(es_handle, 60, NULL);
+    
+    // Configure microphone (analog)
+    es8311_microphone_config(es_handle, false);
+    
+    // Set microphone gain
+    es8311_microphone_gain_set(es_handle, ES8311_MIC_GAIN_30DB);
+    
+    ESP_LOGI(TAG, "ES8311 initialized successfully!");
+    
+    // 6. Initialize I2S
+    ESP_LOGI(TAG, "\nInitializing I2S...");
+    if (init_i2s_driver() != ESP_OK) {
+        ESP_LOGE(TAG, "I2S init failed");
+        return;
+    }
+    
+    // 7. Initialize buttons
+    ESP_LOGI(TAG, "\nInitializing buttons...");
+    if (init_buttons() != ESP_OK) {
+        ESP_LOGE(TAG, "Failed to initialize buttons");
+        return;
+    }
+    
+    // 8. Play a test beep to confirm audio works
+    ESP_LOGI(TAG, "\nPlaying test beep...");
+    xTaskCreate(beep_task, "beep_task", 2048, NULL, 5, NULL);
+    vTaskDelay(pdMS_TO_TICKS(1500));  // Wait for beep to finish
+    
+    ESP_LOGI(TAG, "\n=== System Ready ===");
+    ESP_LOGI(TAG, "Press buttons to control:");
+    ESP_LOGI(TAG, "  - GPIO%d: Record (starts with beep)", BUTTON_REC_GPIO);
+    ESP_LOGI(TAG, "  - GPIO%d: Playback", BUTTON_PLAY_GPIO);
+    
+    // Main event loop
+    button_event_t evt;
+    while (1) {
+        if (xQueueReceive(g_button_event_queue, &evt, portMAX_DELAY)) {
+            switch (evt) {
+                case BUTTON_REC_EVENT:
+                    ESP_LOGI(TAG, "Record button pressed");
+                    if (!g_is_recording) {
+                        xTaskCreate(beep_task, "beep_start", 2048, NULL, 5, NULL);
+                        vTaskDelay(pdMS_TO_TICKS(1100));
+                        xTaskCreate(record_audio_task, "record", 4096, NULL, 6, NULL);
+                    }
+                    break;
+                    
+                case BUTTON_PLAY_EVENT:
+                    ESP_LOGI(TAG, "Playback button pressed");
+                    xTaskCreate(playback_audio_task, "playback", 4096, NULL, 5, NULL);
+                    break;
+            }
+        }
+    }
+}
